@@ -1,0 +1,13 @@
+streamlit==1.38.0
+pandas==2.2.2
+numpy==1.26.4
+plotly==5.23.0
+openpyxl==3.1.5
+SQLAlchemy==2.0.32
+passlib[bcrypt]==1.7.4
+pydantic==2.8.2
+python-dotenv==1.0.1
+XlsxWriter==3.2.0
+bcrypt==4.2.0
+psycopg2-binary==2.9.9
+python-dateutil==2.9.0.post0

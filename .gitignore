@@ -1,0 +1,11 @@
+.env
+*.db
+secrets.toml
+__pycache__/
+*.pyc
+uploads/*
+exports/*
+!uploads/.gitkeep
+!exports/.gitkeep
+.venv/
+venv/

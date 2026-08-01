@@ -2,6 +2,7 @@ import streamlit as st
 from utils.auth import current_user, logout
 
 NAV_ITEMS = [
+    ("app", "Phân tích nhanh", "🔍"),
     ("dashboard", "Dashboard", "📊"),
     ("upload_center", "Upload Center", "⬆️"),
     ("forecast_engine", "Forecast Engine", "📈"),
@@ -15,6 +16,12 @@ NAV_ITEMS = [
 
 
 def render_sidebar(active_key: str):
+    # Ẩn menu điều hướng tự động của Streamlit (danh sách file trong pages/)
+    # để chỉ còn lại menu tự vẽ bên dưới — tránh bị 2 menu chồng nhau.
+    st.markdown(
+        "<style>[data-testid='stSidebarNav']{display:none;}</style>",
+        unsafe_allow_html=True,
+    )
     with st.sidebar:
         st.markdown("### 📦 S&OP Planner")
         st.caption("Sales & Operations Planning")
@@ -27,7 +34,7 @@ def render_sidebar(active_key: str):
         st.divider()
 
         for key, label, icon in NAV_ITEMS:
-            page_path = f"pages/{key}.py"
+            page_path = "app.py" if key == "app" else f"pages/{key}.py"
             if key == active_key:
                 st.markdown(f"**{icon} {label}**  ← đang xem")
             else:

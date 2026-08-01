@@ -225,36 +225,53 @@ def infer_data_period(df: pd.DataFrame, data_type: str) -> str:
 
 
 def save_master_data(db: Session, clean_df: pd.DataFrame, upload_id: str, username: str, source_file: str) -> int:
+    """Lưu Master Data. Gộp toàn bộ việc kiểm tra SKU đã tồn tại thành 1 câu
+    truy vấn (thay vì 1 câu/dòng) — trên database ở xa (Neon/Postgres), mỗi
+    câu truy vấn tốn ~50-150ms round-trip; với hàng nghìn dòng, kiểu cũ có
+    thể mất nhiều phút. Cách này chỉ còn 1 round-trip cho toàn bộ danh sách."""
+    rows_data = [df_row_to_master(row) for _, row in clean_df.iterrows()]
+    sku_codes = [d["sku_code"] for d in rows_data]
+    existing_map = {}
+    if sku_codes:
+        existing_map = {p.sku_code: p for p in db.query(Product).filter(Product.sku_code.in_(sku_codes)).all()}
+
     count = 0
-    for _, row in clean_df.iterrows():
-        data = df_row_to_master(row)
-        existing = db.query(Product).filter_by(sku_code=data["sku_code"]).first()
+    for data in rows_data:
+        existing = existing_map.get(data["sku_code"])
         if existing:
             for k, v in data.items():
                 setattr(existing, k, v)
             existing.upload_id = upload_id
             existing.source_file = source_file
         else:
-            db.add(Product(**data, upload_id=upload_id, source_file=source_file, created_by=username))
+            new_obj = Product(**data, upload_id=upload_id, source_file=source_file, created_by=username)
+            db.add(new_obj)
+            existing_map[data["sku_code"]] = new_obj  # phòng file có SKU trùng nhau trong cùng lần upload
         count += 1
     return count
 
 
+_DATE_FIELD = {"RAW_SI": "txn_date", "RAW_SO": "txn_date", "RAW_INVENTORY": "snapshot_date", "RAW_PO": "po_date"}
+
+
 def save_transactional(db: Session, data_type: str, clean_df: pd.DataFrame, upload_id: str,
                         username: str, source_file: str, update_mode: str, data_period: str) -> int:
+    """Lưu dữ liệu giao dịch (SI/SO/Inventory/PO). Cùng lý do như
+    save_master_data ở trên: gộp việc tìm bản ghi trùng thành 1 câu truy vấn
+    duy nhất (theo khoảng ngày của cả lô dữ liệu, hoặc theo po_number với PO)
+    thay vì 1 câu truy vấn cho từng dòng — tránh treo lâu khi DB ở xa."""
     model = MODEL_MAP[data_type]
     mapper = ROW_MAPPERS[data_type]
+    date_field_name = _DATE_FIELD[data_type]
+    date_col = getattr(model, date_field_name)
 
     if update_mode == "Replace selected period":
-        period_field = {"RAW_SI": model.txn_date, "RAW_SO": model.txn_date,
-                         "RAW_INVENTORY": model.snapshot_date, "RAW_PO": model.po_date}[data_type]
         y, m = map(int, data_period.split("-"))
         from calendar import monthrange
         start = date(y, m, 1)
         end = date(y, m, monthrange(y, m)[1])
-        db.execute(delete(model).where(period_field >= start, period_field <= end))
+        db.execute(delete(model).where(date_col >= start, date_col <= end))
 
-    count = 0
     dup_keys = {
         "RAW_SI": ["txn_date", "dealer", "sku_code", "invoice_number"],
         "RAW_SO": ["txn_date", "dealer", "store", "sku_code"],
@@ -262,12 +279,27 @@ def save_transactional(db: Session, data_type: str, clean_df: pd.DataFrame, uplo
         "RAW_PO": ["po_number", "sku_code"],
     }[data_type]
 
-    for _, row in clean_df.iterrows():
-        data = mapper(row)
+    rows_data = [mapper(row) for _, row in clean_df.iterrows()]
+
+    existing_map = {}
+    if update_mode == "Update existing records" and rows_data:
+        if data_type == "RAW_PO":
+            po_numbers = [d.get("po_number") for d in rows_data if d.get("po_number")]
+            existing_records = db.query(model).filter(model.po_number.in_(po_numbers)).all() if po_numbers else []
+        else:
+            dates = [d.get(date_field_name) for d in rows_data if d.get(date_field_name)]
+            existing_records = (
+                db.query(model).filter(date_col >= min(dates), date_col <= max(dates)).all() if dates else []
+            )
+        for rec in existing_records:
+            existing_map[tuple(getattr(rec, k) for k in dup_keys)] = rec
+
+    count = 0
+    for data in rows_data:
         record = None
+        key = tuple(data.get(k) for k in dup_keys)
         if update_mode == "Update existing records":
-            filt = {k: data.get(k) for k in dup_keys}
-            record = db.query(model).filter_by(**filt).first()
+            record = existing_map.get(key)
         if record:
             for k, v in data.items():
                 setattr(record, k, v)
@@ -275,8 +307,11 @@ def save_transactional(db: Session, data_type: str, clean_df: pd.DataFrame, uplo
             record.source_file = source_file
             record.data_period = data_period
         else:
-            db.add(model(**data, upload_id=upload_id, source_file=source_file,
-                          created_by=username, data_period=data_period))
+            new_obj = model(**data, upload_id=upload_id, source_file=source_file,
+                             created_by=username, data_period=data_period)
+            db.add(new_obj)
+            if update_mode == "Update existing records":
+                existing_map[key] = new_obj
         count += 1
     return count
 

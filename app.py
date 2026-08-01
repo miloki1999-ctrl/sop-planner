@@ -3,6 +3,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent))
 
 from datetime import date
+import io
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -69,6 +70,30 @@ def render_quick_analysis():
     st.title("🔍 Phân tích dữ liệu nhanh")
     st.caption("Kéo file Excel vào → Chọn tháng cần Forecast → Nhấn Phân tích dữ liệu → Xem Dashboard → Tải Excel.")
 
+    if st.button("📎 Dùng Sample Data để thử nhanh"):
+        sample_path = Path(__file__).resolve().parent / "sample_data" / "SOP_Sample_Upload.xlsx"
+        if sample_path.exists():
+            file_bytes = sample_path.read_bytes()
+            st.session_state["quick_file_bytes"] = file_bytes
+            st.session_state["quick_file_name"] = sample_path.name
+            # Tự động chọn Tháng/Năm Forecast khớp với dữ liệu mẫu (1 tháng sau tháng
+            # cuối cùng có Sell Out) — tránh trường hợp người dùng để mặc định
+            # Năm/Tháng hiện tại (không trùng với dữ liệu mẫu) khiến Dashboard toàn số 0.
+            try:
+                so_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="RAW_SO")
+                date_col = "Date" if "Date" in so_df.columns else so_df.columns[0]
+                last_date = pd.to_datetime(so_df[date_col], errors="coerce").max()
+                if pd.notna(last_date):
+                    nm = last_date.month + 1
+                    ny = last_date.year + (1 if nm > 12 else 0)
+                    nm = 1 if nm > 12 else nm
+                    st.session_state["quick_default_year"] = ny
+                    st.session_state["quick_default_month"] = nm
+            except Exception:
+                pass  # nếu không đọc được ngày, dùng mặc định ngày hôm nay như bình thường
+        else:
+            st.error("Chưa có sample data. Chạy `python -m sample_data.generate_sample_data` trước.")
+
     c1, c2 = st.columns([2, 1])
     with c1:
         uploaded_file = st.file_uploader(
@@ -77,17 +102,13 @@ def render_quick_analysis():
         )
     with c2:
         today = date.today()
-        year = st.selectbox("Năm Forecast", list(range(2023, 2027)), index=min(2, 3))
-        month = st.selectbox("Tháng Forecast", list(range(1, 13)), index=today.month - 1)
+        default_year = st.session_state.get("quick_default_year", today.year)
+        default_month = st.session_state.get("quick_default_month", today.month)
+        years_list = list(range(2023, today.year + 3))
+        year_index = years_list.index(default_year) if default_year in years_list else len(years_list) - 1
+        year = st.selectbox("Năm Forecast", years_list, index=year_index)
+        month = st.selectbox("Tháng Forecast", list(range(1, 13)), index=default_month - 1)
     target_period = f"{year}-{month:02d}"
-
-    if st.button("📎 Dùng Sample Data để thử nhanh"):
-        sample_path = Path(__file__).resolve().parent / "sample_data" / "SOP_Sample_Upload.xlsx"
-        if sample_path.exists():
-            st.session_state["quick_file_bytes"] = sample_path.read_bytes()
-            st.session_state["quick_file_name"] = sample_path.name
-        else:
-            st.error("Chưa có sample data. Chạy `python -m sample_data.generate_sample_data` trước.")
 
     if uploaded_file is not None:
         st.session_state["quick_file_bytes"] = uploaded_file.read()

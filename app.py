@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from utils.auth import login, current_user, logout
+from components.sidebar import render_sidebar
 from database.init_db import create_tables, seed_admin, seed_assumptions, seed_dealers
 from database.connection import get_session
 from database.models import ForecastVersion, ForecastDetail, SupplyPlan
@@ -63,27 +64,7 @@ def render_quick_analysis():
     Upload Center / Forecast Engine / Supply Plan pages remain in the sidebar for
     granular control (custom update mode, method, filters, manual adjustment)."""
     user = current_user()
-
-    with st.sidebar:
-        st.markdown("### 📦 S&OP Planner")
-        st.caption("Sales & Operations Planning")
-        st.divider()
-        st.markdown(f"**{user['full_name']}**")
-        st.caption(user["role"])
-        st.divider()
-        st.markdown("##### Chế độ chi tiết")
-        for key, label, icon in [
-            ("dashboard", "Dashboard", "📊"), ("upload_center", "Upload Center", "⬆️"),
-            ("forecast_engine", "Forecast Engine", "📈"), ("supply_plan", "Supply Plan", "🚚"),
-            ("exception_report", "Exception Report", "⚠️"), ("version_history", "Version History", "🕘"),
-            ("data_quality", "Data Quality", "✅"), ("master_data", "Master Data", "🗂️"),
-            ("assumptions", "Assumptions", "⚙️"),
-        ]:
-            st.page_link(f"pages/{key}.py", label=f"{icon} {label}")
-        st.divider()
-        if st.button("🚪 Đăng xuất", use_container_width=True):
-            logout()
-            st.rerun()
+    render_sidebar("app")
 
     st.title("🔍 Phân tích dữ liệu nhanh")
     st.caption("Kéo file Excel vào → Chọn tháng cần Forecast → Nhấn Phân tích dữ liệu → Xem Dashboard → Tải Excel.")

@@ -39,7 +39,17 @@ def current_user() -> dict | None:
 def require_login():
     if not current_user():
         st.warning("Vui lòng đăng nhập để tiếp tục.")
-        st.page_link("app.py", label="🔑 Quay lại trang đăng nhập")
+        # Cho đăng nhập ngay tại đây thay vì chỉ dẫn người dùng sang trang
+        # khác — tránh phụ thuộc vào việc điều hướng multipage (page_link)
+        # hoạt động đúng trong mọi phiên bản/trạng thái của Streamlit Cloud.
+        with st.form("require_login_inline_form"):
+            u = st.text_input("Tên đăng nhập")
+            p = st.text_input("Mật khẩu", type="password")
+            if st.form_submit_button("Đăng nhập", type="primary"):
+                if login(u, p):
+                    st.rerun()
+                else:
+                    st.error("Sai tên đăng nhập hoặc mật khẩu, hoặc tài khoản bị khóa.")
         st.stop()
 
 

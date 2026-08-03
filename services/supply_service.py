@@ -17,29 +17,39 @@ Version (forward-looking), divided by the number of days in the target
 month — this is what drives DOS/Suggested PO for *future* procurement
 decisions, which is the actual business use of this page (Sellable
 Inventory today vs. what we'll need going forward).
+
+Performance note: this runs once per (scenario x ForecastDetail), i.e. 4x
+the number of Dealer x SKU rows in the Forecast Version. The inventory
+snapshot for a given (dealer, sku) is the same across all 4 scenarios, so
+it's prefetched ONCE for the whole run (one query) instead of being
+queried again for every scenario — see load_latest_inventory_map(). Same
+idea for Assumptions (Scenario factors / DOS thresholds): loaded once into
+a dict via forecast_service.load_all_assumptions() instead of querying the
+Assumption table on every row.
 """
 from datetime import date, timedelta
 from calendar import monthrange
 import math
+import pandas as pd
 from sqlalchemy.orm import Session
 from sqlalchemy import delete
 
 from database.models import (
     Product, ForecastVersion, ForecastDetail, InventorySnapshot, SupplyPlan,
 )
-from services.forecast_service import get_assumption
+from services.forecast_service import get_assumption, load_all_assumptions
 
 SCENARIOS = ["Conservative", "Base", "Target", "Stretch"]
 
 
-def get_scenario_factor(db: Session, scenario: str) -> float:
+def get_scenario_factor(amap: dict, scenario: str) -> float:
     defaults = {"Conservative": 0.90, "Base": 1.00, "Target": 1.10, "Stretch": 1.20}
-    return get_assumption(db, "Scenario", scenario, defaults.get(scenario, 1.0))
+    return get_assumption(amap, "Scenario", scenario, defaults.get(scenario, 1.0))
 
 
-def get_dos_thresholds(db: Session) -> dict:
+def get_dos_thresholds(amap: dict) -> dict:
     defaults = {"critical": 30, "reorder": 45, "healthy": 70, "watch": 95}
-    return {k: get_assumption(db, "DOS_Threshold", k, v) for k, v in defaults.items()}
+    return {k: get_assumption(amap, "DOS_Threshold", k, v) for k, v in defaults.items()}
 
 
 def classify_dos(dos, thresholds: dict) -> str:
@@ -56,16 +66,32 @@ def classify_dos(dos, thresholds: dict) -> str:
     return "Overstock"
 
 
-def get_latest_inventory(db: Session, dealer: str, sku: str):
-    snap = (
-        db.query(InventorySnapshot)
-        .filter_by(dealer=dealer, sku_code=sku)
-        .order_by(InventorySnapshot.snapshot_date.desc())
-        .first()
+def load_latest_inventory_map(db: Session, dealers: list, skus: list) -> dict:
+    """One query for every relevant InventorySnapshot row, instead of one
+    query per (dealer, sku) x scenario. Returns
+    {(dealer, sku_code): (sellable_inventory, inbound_quantity, snapshot_date)}
+    keeping only the most recent snapshot per (dealer, sku)."""
+    if not dealers or not skus:
+        return {}
+    rows = (
+        db.query(InventorySnapshot.dealer, InventorySnapshot.sku_code, InventorySnapshot.snapshot_date,
+                  InventorySnapshot.sellable_inventory, InventorySnapshot.inbound_quantity)
+        .filter(InventorySnapshot.dealer.in_(dealers), InventorySnapshot.sku_code.in_(skus))
+        .all()
     )
-    if not snap:
-        return 0.0, 0.0, None
-    return snap.sellable_inventory, snap.inbound_quantity, snap.snapshot_date
+    if not rows:
+        return {}
+    df = pd.DataFrame(rows, columns=["dealer", "sku_code", "snapshot_date", "sellable_inventory", "inbound_quantity"])
+    latest_idx = df.groupby(["dealer", "sku_code"])["snapshot_date"].idxmax()
+    latest = df.loc[latest_idx]
+    return {
+        (r.dealer, r.sku_code): (r.sellable_inventory, r.inbound_quantity, r.snapshot_date)
+        for r in latest.itertuples()
+    }
+
+
+def get_latest_inventory(inv_map: dict, dealer: str, sku: str):
+    return inv_map.get((dealer, sku), (0.0, 0.0, None))
 
 
 def round_to_order_multiple(qty: float, moq: int, order_multiple: int) -> float:
@@ -75,16 +101,16 @@ def round_to_order_multiple(qty: float, moq: int, order_multiple: int) -> float:
     return max(rounded, moq)
 
 
-def compute_supply_plan_row(db: Session, product: Product, dealer: str, forecast_so: float,
+def compute_supply_plan_row(amap: dict, inv_map: dict, product: Product, dealer: str, forecast_so: float,
                              scenario: str, cutoff_date: date, target_period: str,
                              dos_thresholds: dict) -> dict:
     y, m = map(int, target_period.split("-"))
     days_in_month = monthrange(y, m)[1]
 
-    sellable_inventory, confirmed_inbound, _ = get_latest_inventory(db, dealer, product.sku_code)
+    sellable_inventory, confirmed_inbound, _ = get_latest_inventory(inv_map, dealer, product.sku_code)
     beginning_inventory = sellable_inventory
 
-    scenario_factor = get_scenario_factor(db, scenario)
+    scenario_factor = get_scenario_factor(amap, scenario)
     plan_so = round(forecast_so * scenario_factor, 1)
     so_per_day = round(forecast_so / days_in_month, 2) if days_in_month else 0.0
 
@@ -163,8 +189,13 @@ def run_supply_plan(db: Session, *, forecast_version_id: int, cutoff_date: date,
 
     db.execute(delete(SupplyPlan).where(SupplyPlan.version_id == forecast_version_id))
 
-    dos_thresholds = get_dos_thresholds(db)
+    amap = load_all_assumptions(db)
+    dos_thresholds = get_dos_thresholds(amap)
     products = {p.sku_code: p for p in db.query(Product).all()}
+
+    dealers_in_scope = list({d.dealer for d in details})
+    skus_in_scope = list({d.sku_code for d in details})
+    inv_map = load_latest_inventory_map(db, dealers_in_scope, skus_in_scope)
 
     count = 0
     base_rows = []
@@ -174,7 +205,7 @@ def run_supply_plan(db: Session, *, forecast_version_id: int, cutoff_date: date,
             if not product:
                 continue
             row = compute_supply_plan_row(
-                db, product, d.dealer, d.final_forecast_so, scenario, cutoff_date,
+                amap, inv_map, product, d.dealer, d.final_forecast_so, scenario, cutoff_date,
                 version.data_period, dos_thresholds,
             )
             db.add(SupplyPlan(

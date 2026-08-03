@@ -1,266 +1,156 @@
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+"""
+Quick Analysis service — orchestrates the simplified default flow:
+Upload file -> Validate -> Save DB -> Run Forecast -> Run Supply Plan.
 
+This does NOT replace the granular services (upload_service, forecast_service,
+supply_service) — it just chains them with sensible defaults so the new
+default landing page can do everything in one click. Power users can still
+go into Upload Center / Forecast Engine / Supply Plan individually for
+fine-grained control (different update modes, method selection, filters...).
+
+Default choices made here (documented, not hidden):
+- Update mode for every sheet = "Update existing records" (upsert by natural
+  key) so re-running Quick Analysis on a corrected file is always safe and
+  idempotent — no duplicate accumulation.
+- Forecast method = Weighted Moving Average (recommended default).
+- Cutoff date = latest transaction date found in the uploaded RAW_SO sheet,
+  falling back to today if RAW_SO wasn't in the file.
+- Supply Plan runs all 4 scenarios (Conservative/Base/Target/Stretch).
+"""
+from dataclasses import dataclass, field
 from datetime import date, datetime
 import pandas as pd
-import streamlit as st
+from sqlalchemy.orm import Session
 
-from utils.auth import require_login, require_permission, current_user
-from components.sidebar import render_sidebar
-from database.connection import get_session
-from database.models import Product, Dealer, ForecastVersion, ForecastDetail, AuditLog
-from services.forecast_service import (
-    run_forecast_engine, apply_manual_adjustment, compute_accuracy_for_version, classify_accuracy,
+from services.upload_service import (
+    load_workbook, save_master_data, save_transactional, create_upload_history, infer_data_period,
 )
-from services.export_service import export_df_to_excel
+from services.validation_service import validate_dataframe, compute_file_hash, check_duplicate_file
+from services.forecast_service import run_forecast_engine
+from services.supply_service import run_supply_plan
 
-st.set_page_config(page_title="Forecast Engine", page_icon="📈", layout="wide")
-require_login()
-render_sidebar("forecast_engine")
-user = current_user()
+DATA_TYPE_LABELS = {
+    "MASTER_DATA": "Master Data", "RAW_SI": "Sell-In (SI)", "RAW_SO": "Sell-Out (SO)",
+    "RAW_INVENTORY": "Inventory", "RAW_PO": "Purchase Order (PO)",
+}
 
-st.title("📈 Forecast Engine")
-st.caption("Tính Forecast SO theo nhiều phương pháp, kết hợp Growth/Seasonality/Promotion/Coverage, cho phép chỉnh tay.")
 
-tab_run, tab_results, tab_accuracy = st.tabs(["▶️ Chạy Forecast mới", "📋 Kết quả & Chỉnh tay", "🎯 Forecast Accuracy"])
+@dataclass
+class QuickAnalysisResult:
+    file_name: str
+    detected_sheets: list = field(default_factory=list)
+    unknown_sheet: bool = False
+    validation_summary: dict = field(default_factory=dict)  # {data_type: {total, valid, error, warn}}
+    error_reports: dict = field(default_factory=dict)  # {data_type: DataFrame of errors}
+    saved_rows: dict = field(default_factory=dict)
+    duplicate_file_warning: str = None
+    forecast_version_id: int = None
+    forecast_version_name: str = None
+    supply_plan_rows: int = 0
+    target_period: str = None
+    success: bool = False
+    error_message: str = None
 
-# =============================================================================
-# TAB 1 — RUN NEW FORECAST
-# =============================================================================
-with tab_run:
-    require_permission("edit_forecast")
-    st.subheader("Tham số chạy Forecast")
 
-    with get_session() as db:
-        all_dealers = [d.dealer_name for d in db.query(Dealer).filter_by(is_active=True).all()]
-        all_brands = sorted({p.brand for p in db.query(Product.brand).distinct()})
-        all_categories = sorted({p.category for p in db.query(Product.category).distinct()})
+def infer_cutoff_date(parsed: dict) -> date:
+    if "RAW_SO" in parsed and not parsed["RAW_SO"].empty and "Date" in parsed["RAW_SO"].columns:
+        dates = pd.to_datetime(parsed["RAW_SO"]["Date"], errors="coerce").dropna()
+        if not dates.empty:
+            return dates.max().date()
+    return date.today()
 
-    c1, c2 = st.columns(2)
-    with c1:
-        cutoff_date = st.date_input("Data Cutoff Date", value=date(2024, 5, 31))
-    with c2:
-        target_year = st.number_input("Năm Forecast", min_value=2023, max_value=2030, value=cutoff_date.year)
-        target_month = st.number_input("Tháng Forecast", min_value=1, max_value=12,
-                                        value=(cutoff_date.month % 12) + 1)
-    target_period = f"{int(target_year)}-{int(target_month):02d}"
 
-    method = st.radio(
-        "Phương pháp Forecast (Statistical Base)",
-        ["Weighted Moving Average", "Average 3M", "Average 6M", "Run-rate"],
-        horizontal=True,
-        help="EOL / Phase-out / NPI SKU sẽ tự động dùng công thức riêng bất kể chọn phương pháp nào ở đây.",
-    )
+def run_quick_analysis(db: Session, *, file_bytes: bytes, file_name: str, target_period: str,
+                        username: str, method: str = "Weighted Moving Average") -> QuickAnalysisResult:
+    result = QuickAnalysisResult(file_name=file_name, target_period=target_period)
 
-    st.markdown("##### Bộ lọc phạm vi (bỏ trống = chạy toàn bộ)")
-    f1, f2, f3 = st.columns(3)
-    with f1:
-        dealer_filter = st.multiselect("Dealer", all_dealers)
-    with f2:
-        brand_filter = st.multiselect("Brand", all_brands)
-    with f3:
-        category_filter = st.multiselect("Category", all_categories)
+    file_hash = compute_file_hash(file_bytes)
+    dup = check_duplicate_file(db, file_hash)
+    if dup:
+        result.duplicate_file_warning = (
+            f"File này đã từng upload lúc {dup.uploaded_at:%d/%m/%Y %H:%M} (Upload ID: {dup.upload_id}). "
+            f"Vẫn tiếp tục xử lý lại."
+        )
 
-    version_name = st.text_input(
-        "Tên Version",
-        value=f"{target_period} Draft {datetime.now().strftime('%H%M%S')}",
-    )
+    try:
+        parsed = load_workbook(file_bytes, file_name)
+    except Exception as e:
+        result.error_message = f"Không đọc được file: {e}"
+        return result
 
-    if st.button("▶️ Chạy Forecast Engine", type="primary"):
-        with st.spinner("Đang tính Forecast cho tất cả Dealer × SKU..."):
-            with get_session() as db:
-                try:
-                    version = run_forecast_engine(
-                        db, version_name=version_name, target_period=target_period, cutoff_date=cutoff_date,
-                        method=method, username=user["username"],
-                        dealer_filter=dealer_filter or None, brand_filter=brand_filter or None,
-                        category_filter=category_filter or None,
-                    )
-                    db.add(AuditLog(table_name="forecast_versions", record_ref=version.version_name,
-                                     action="INSERT", forecast_version=version.version_name,
-                                     performed_by=user["username"], reason="Run Forecast Engine"))
-                    st.session_state["last_forecast_version_id"] = version.record_id
-                    st.success(
-                        f"✅ Đã tạo version **{version.version_name}** — "
-                        f"Total Forecast SO: **{version.total_forecast_so:,.0f}**"
-                    )
-                except Exception as e:
-                    # Quan trọng: rollback ngay tại đây. Nếu không, transaction vẫn ở
-                    # trạng thái lỗi và lệnh commit tự động khi thoát khỏi "with
-                    # get_session()" phía trên sẽ ném ra PendingRollbackError, làm
-                    # crash toàn bộ trang thay vì chỉ hiện thông báo lỗi này.
-                    db.rollback()
-                    st.error(f"Lỗi khi chạy Forecast: {e}")
+    if "UNKNOWN" in parsed:
+        result.unknown_sheet = True
+        result.error_message = (
+            "Không nhận diện được loại dữ liệu từ tên sheet/cấu trúc cột. "
+            "Kiểm tra lại tên sheet: MASTER_DATA / RAW_SI / RAW_SO / RAW_INVENTORY / RAW_PO."
+        )
+        return result
 
-# =============================================================================
-# TAB 2 — RESULTS & MANUAL ADJUSTMENT
-# =============================================================================
-with tab_results:
-    with get_session() as db:
-        versions = db.query(ForecastVersion).order_by(ForecastVersion.created_at.desc()).all()
-        version_options = {f"{v.version_name} ({v.status}) — {v.data_period}": v.record_id for v in versions}
+    result.detected_sheets = list(parsed.keys())
+    cutoff_date = infer_cutoff_date(parsed)
 
-    if not version_options:
-        st.info("Chưa có Forecast Version nào. Hãy chạy Forecast ở tab đầu tiên.")
-    else:
-        default_idx = 0
-        if st.session_state.get("last_forecast_version_id"):
-            ids = list(version_options.values())
-            if st.session_state["last_forecast_version_id"] in ids:
-                default_idx = ids.index(st.session_state["last_forecast_version_id"])
+    # --- Validate + Save each sheet (MASTER_DATA first so SKU/Dealer checks work for the rest) ---
+    order = ["MASTER_DATA", "RAW_SI", "RAW_SO", "RAW_INVENTORY", "RAW_PO"]
+    for data_type in [d for d in order if d in parsed]:
+        df = parsed[data_type]
+        vr = validate_dataframe(data_type, df, db, file_hash)
+        result.validation_summary[data_type] = dict(
+            total=vr.total_rows, valid=vr.valid_rows, error=vr.error_rows, warning=vr.warning_rows,
+        )
+        if vr.errors:
+            result.error_reports[data_type] = pd.DataFrame(vr.errors)
 
-        selected_label = st.selectbox("Chọn Version", list(version_options.keys()), index=default_idx)
-        vid = version_options[selected_label]
+        period = infer_data_period(vr.clean_df, data_type) if data_type != "MASTER_DATA" else target_period
 
-        with get_session() as db:
-            version = db.get(ForecastVersion, vid)
-            details = db.query(ForecastDetail).filter_by(version_id=vid).all()
+        if vr.valid_rows == 0:
+            create_upload_history(
+                db, file_name=file_name, file_hash=file_hash, username=username, data_type=data_type,
+                data_period=period, total_rows=vr.total_rows, valid_rows=0, error_rows=vr.error_rows,
+                warning_rows=vr.warning_rows, status="Rejected", update_mode="Update existing records",
+                notes="Quick Analysis — no valid rows",
+            )
+            continue
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Status", version.status)
-            m2.metric("Total Forecast SO", f"{version.total_forecast_so:,.0f}")
-            m3.metric("Số dòng", len(details))
-            m4.metric("Data Cutoff", version.data_cutoff_date.strftime("%d/%m/%Y") if version.data_cutoff_date else "-")
+        upload_id = create_upload_history(
+            db, file_name=file_name, file_hash=file_hash, username=username, data_type=data_type,
+            data_period=period, total_rows=vr.total_rows, valid_rows=vr.valid_rows, error_rows=vr.error_rows,
+            warning_rows=vr.warning_rows, status="Saved", update_mode="Update existing records",
+            notes="Quick Analysis Mode",
+        )
+        if data_type == "MASTER_DATA":
+            n = save_master_data(db, vr.clean_df, upload_id, username, file_name)
+        else:
+            n = save_transactional(db, data_type, vr.clean_df, upload_id, username, file_name,
+                                    "Update existing records", period)
+        result.saved_rows[data_type] = n
 
-            st.markdown("##### Bộ lọc kết quả")
-            fc1, fc2, fc3 = st.columns(3)
-            with fc1:
-                f_dealer = st.multiselect("Dealer", sorted({d.dealer for d in details}), key="res_dealer")
-            with fc2:
-                f_brand = st.multiselect("Brand", sorted({d.brand for d in details}), key="res_brand")
-            with fc3:
-                f_sku = st.text_input("Tìm SKU", key="res_sku")
+    db.flush()
 
-            rows = []
-            for d in details:
-                if f_dealer and d.dealer not in f_dealer:
-                    continue
-                if f_brand and d.brand not in f_brand:
-                    continue
-                if f_sku and f_sku.upper() not in d.sku_code.upper():
-                    continue
-                rows.append({
-                    "id": d.record_id, "Dealer": d.dealer, "Brand": d.brand, "SKU Code": d.sku_code,
-                    "Avg 3M": d.avg_3m, "Avg 6M": d.avg_6m, "Weighted": d.weighted_forecast,
-                    "Statistical": d.statistical_forecast, "Growth Factor": d.growth_factor,
-                    "Seasonal Factor": d.seasonal_factor, "Promotion Factor": d.promotion_factor,
-                    "Coverage Factor": d.coverage_factor, "Manual Adj. Factor": d.manual_adjustment_factor,
-                    "Final Forecast SO": d.final_forecast_so, "Method": d.forecast_method,
-                    "Comment": d.forecast_comment or "",
-                })
+    # --- Run Forecast Engine (full scope, no filters) ---
+    try:
+        version = run_forecast_engine(
+            db, version_name=f"{target_period} Quick Analysis {datetime.now().strftime('%H%M%S')}",
+            target_period=target_period, cutoff_date=cutoff_date, method=method, username=username,
+        )
+        result.forecast_version_id = version.record_id
+        result.forecast_version_name = version.version_name
+    except Exception as e:
+        # Quan trọng: rollback ngay khi bắt lỗi. `db` ở đây được truyền từ
+        # `with get_session() as db:` bên app.py — nếu không rollback, session
+        # vẫn ở trạng thái lỗi và lệnh commit tự động khi hàm return sẽ ném
+        # PendingRollbackError, crash toàn bộ trang thay vì chỉ báo lỗi này.
+        db.rollback()
+        result.error_message = f"Lỗi khi chạy Forecast Engine: {e}"
+        return result
 
-            if not rows:
-                st.warning("Không có dòng nào khớp bộ lọc.")
-            else:
-                df = pd.DataFrame(rows)
-                st.caption(f"{len(df)} dòng — chỉnh **Manual Adj. Factor** trực tiếp trong bảng rồi bấm Lưu (1.0 = không đổi, 1.1 = +10%, 0.9 = -10%).")
-                edited = st.data_editor(
-                    df, use_container_width=True, height=420, hide_index=True,
-                    disabled=[c for c in df.columns if c not in ("Manual Adj. Factor",)],
-                    key=f"editor_{vid}",
-                    column_config={"id": None},
-                )
+    # --- Run Supply Plan (all 4 scenarios) ---
+    try:
+        n = run_supply_plan(db, forecast_version_id=version.record_id, cutoff_date=cutoff_date, username=username)
+        result.supply_plan_rows = n
+    except Exception as e:
+        db.rollback()
+        result.error_message = f"Lỗi khi chạy Supply Plan: {e}"
+        return result
 
-                st.download_button(
-                    "⬇️ Export Forecast Detail (Excel)",
-                    data=export_df_to_excel(df.drop(columns=["id"]), sheet_name="Forecast Detail"),
-                    file_name=f"forecast_detail_{version.data_period}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-                changed = edited[edited["Manual Adj. Factor"] != df["Manual Adj. Factor"]]
-                if len(changed) > 0:
-                    reason = st.text_input("Lý do chỉnh (áp dụng cho tất cả thay đổi ở lần lưu này)",
-                                            value="Điều chỉnh theo thực tế thị trường")
-                    if st.button(f"💾 Lưu {len(changed)} thay đổi", type="primary"):
-                        with get_session() as db:
-                            for _, row in changed.iterrows():
-                                detail = db.get(ForecastDetail, int(row["id"]))
-                                apply_manual_adjustment(db, detail, float(row["Manual Adj. Factor"]), reason, user["username"])
-                            v = db.get(ForecastVersion, vid)
-                            total_rows = db.query(ForecastDetail).filter_by(version_id=vid).all()
-                            v.total_forecast_so = round(sum(d.final_forecast_so for d in total_rows), 1)
-                        st.success("Đã lưu Manual Adjustment (tự động ghi vào Audit Log).")
-                        st.rerun()
-
-            st.divider()
-            colv1, colv2 = st.columns(2)
-            with colv1:
-                if version.status == "Draft" and st.button("📝 Chuyển sang Revised"):
-                    with get_session() as db:
-                        v = db.get(ForecastVersion, vid)
-                        v.status = "Revised"
-                        db.add(AuditLog(table_name="forecast_versions", record_ref=v.version_name,
-                                         action="UPDATE", forecast_version=v.version_name,
-                                         performed_by=user["username"], reason="Status -> Revised"))
-                    st.rerun()
-            with colv2:
-                if version.status in ("Draft", "Revised") and st.button(
-                        "✅ Approve Version", disabled=(user["role"] not in ("Admin", "Planner"))):
-                    with get_session() as db:
-                        v = db.get(ForecastVersion, vid)
-                        v.status = "Approved"
-                        db.add(AuditLog(table_name="forecast_versions", record_ref=v.version_name,
-                                         action="APPROVE", forecast_version=v.version_name,
-                                         performed_by=user["username"]))
-                    st.success("Đã Approve version này.")
-                    st.rerun()
-
-# =============================================================================
-# TAB 3 — FORECAST ACCURACY
-# =============================================================================
-with tab_accuracy:
-    st.subheader("Forecast Accuracy (backtest với dữ liệu SO thực tế đã có)")
-    with get_session() as db:
-        versions = db.query(ForecastVersion).order_by(ForecastVersion.created_at.desc()).all()
-        version_options2 = {f"{v.version_name} — {v.data_period}": v.record_id for v in versions}
-
-    if not version_options2:
-        st.info("Chưa có Forecast Version nào.")
-    else:
-        selected2 = st.selectbox("Chọn Version để đánh giá Accuracy", list(version_options2.keys()), key="acc_version")
-        vid2 = version_options2[selected2]
-
-        if st.button("🎯 Tính Forecast Accuracy"):
-            with get_session() as db:
-                v = db.get(ForecastVersion, vid2)
-                acc_df = compute_accuracy_for_version(db, v)
-
-            if acc_df.empty:
-                st.warning("Chưa có dữ liệu SO thực tế cho kỳ này để so sánh (SO thực tế phải đã được upload).")
-            else:
-                mape = (acc_df["abs_error"] / acc_df["actual_so"].replace(0, 1)).mean() * 100
-                bias = acc_df["forecast_error"].sum() / acc_df["actual_so"].sum() * 100 if acc_df["actual_so"].sum() else 0
-                avg_acc = acc_df["accuracy_pct"].mean()
-
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Avg Accuracy", f"{avg_acc:.1f}%", classify_accuracy(avg_acc))
-                m2.metric("MAPE", f"{mape:.1f}%")
-                m3.metric("Bias", f"{bias:+.1f}%")
-                m4.metric("Số SKU đánh giá", len(acc_df))
-
-                st.markdown("##### Theo Dealer")
-                st.dataframe(
-                    acc_df.groupby("dealer").agg(
-                        Forecast=("final_forecast_so", "sum"), Actual=("actual_so", "sum"),
-                        Accuracy=("accuracy_pct", "mean"),
-                    ).round(1), use_container_width=True,
-                )
-                st.markdown("##### Theo Brand")
-                st.dataframe(
-                    acc_df.groupby("brand").agg(
-                        Forecast=("final_forecast_so", "sum"), Actual=("actual_so", "sum"),
-                        Accuracy=("accuracy_pct", "mean"),
-                    ).round(1), use_container_width=True,
-                )
-                st.markdown("##### Chi tiết theo SKU")
-                acc_display = acc_df.sort_values("accuracy_pct").round(1)
-                st.dataframe(acc_display, use_container_width=True, height=300)
-
-                st.download_button(
-                    "⬇️ Export Forecast Accuracy (Excel)",
-                    data=export_df_to_excel(acc_display, sheet_name="Forecast Accuracy"),
-                    file_name=f"forecast_accuracy_{v.data_period}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+    result.success = True
+    return result

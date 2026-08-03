@@ -202,3 +202,65 @@ with tab_results:
                         v = db.get(ForecastVersion, vid)
                         v.status = "Approved"
                         db.add(AuditLog(table_name="forecast_versions", record_ref=v.version_name,
+                                         action="APPROVE", forecast_version=v.version_name,
+                                         performed_by=user["username"]))
+                    st.success("Đã Approve version này.")
+                    st.rerun()
+
+# =============================================================================
+# TAB 3 — FORECAST ACCURACY
+# =============================================================================
+with tab_accuracy:
+    st.subheader("Forecast Accuracy (backtest với dữ liệu SO thực tế đã có)")
+    with get_session() as db:
+        versions = db.query(ForecastVersion).order_by(ForecastVersion.created_at.desc()).all()
+        version_options2 = {f"{v.version_name} — {v.data_period}": v.record_id for v in versions}
+
+    if not version_options2:
+        st.info("Chưa có Forecast Version nào.")
+    else:
+        selected2 = st.selectbox("Chọn Version để đánh giá Accuracy", list(version_options2.keys()), key="acc_version")
+        vid2 = version_options2[selected2]
+
+        if st.button("🎯 Tính Forecast Accuracy"):
+            with get_session() as db:
+                v = db.get(ForecastVersion, vid2)
+                acc_df = compute_accuracy_for_version(db, v)
+
+            if acc_df.empty:
+                st.warning("Chưa có dữ liệu SO thực tế cho kỳ này để so sánh (SO thực tế phải đã được upload).")
+            else:
+                mape = (acc_df["abs_error"] / acc_df["actual_so"].replace(0, 1)).mean() * 100
+                bias = acc_df["forecast_error"].sum() / acc_df["actual_so"].sum() * 100 if acc_df["actual_so"].sum() else 0
+                avg_acc = acc_df["accuracy_pct"].mean()
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Avg Accuracy", f"{avg_acc:.1f}%", classify_accuracy(avg_acc))
+                m2.metric("MAPE", f"{mape:.1f}%")
+                m3.metric("Bias", f"{bias:+.1f}%")
+                m4.metric("Số SKU đánh giá", len(acc_df))
+
+                st.markdown("##### Theo Dealer")
+                st.dataframe(
+                    acc_df.groupby("dealer").agg(
+                        Forecast=("final_forecast_so", "sum"), Actual=("actual_so", "sum"),
+                        Accuracy=("accuracy_pct", "mean"),
+                    ).round(1), use_container_width=True,
+                )
+                st.markdown("##### Theo Brand")
+                st.dataframe(
+                    acc_df.groupby("brand").agg(
+                        Forecast=("final_forecast_so", "sum"), Actual=("actual_so", "sum"),
+                        Accuracy=("accuracy_pct", "mean"),
+                    ).round(1), use_container_width=True,
+                )
+                st.markdown("##### Chi tiết theo SKU")
+                acc_display = acc_df.sort_values("accuracy_pct").round(1)
+                st.dataframe(acc_display, use_container_width=True, height=300)
+
+                st.download_button(
+                    "⬇️ Export Forecast Accuracy (Excel)",
+                    data=export_df_to_excel(acc_display, sheet_name="Forecast Accuracy"),
+                    file_name=f"forecast_accuracy_{v.data_period}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )

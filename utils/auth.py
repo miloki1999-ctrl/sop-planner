@@ -39,6 +39,7 @@ def current_user() -> dict | None:
 def require_login():
     if not current_user():
         st.warning("Vui lòng đăng nhập để tiếp tục.")
+        st.page_link("app.py", label="🔑 Quay lại trang đăng nhập")
         st.stop()
 
 

@@ -371,4 +371,29 @@ def compute_accuracy_for_version(db: Session, version: ForecastVersion) -> pd.Da
             continue
         d.actual_so = actual
         d.forecast_error = actual - d.final_forecast_so
-        d.forecast_accuracy = round(1 -
+     d.forecast_accuracy = None
+
+        # Guard against division by zero when actual demand is 0.
+        if actual:
+            accuracy_pct = round((1 - abs(d.forecast_error) / actual) * 100, 1)
+            accuracy_pct = max(0.0, accuracy_pct)  # clamp: don't show negative accuracy
+        else:
+            accuracy_pct = None
+
+        d.forecast_accuracy = accuracy_pct
+
+        rows.append({
+            "dealer": d.dealer,
+            "brand": d.brand,
+            "category": d.category,
+            "sku_code": d.sku_code,
+            "data_period": d.data_period,
+            "final_forecast_so": d.final_forecast_so,
+            "actual_so": d.actual_so,
+            "forecast_error": d.forecast_error,
+            "forecast_accuracy_pct": accuracy_pct,
+            "accuracy_category": classify_accuracy(accuracy_pct),
+        })
+
+    db.flush()
+    return pd.DataFrame(rows)

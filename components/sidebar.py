@@ -4,6 +4,7 @@ from utils.auth import current_user, logout
 NAV_ITEMS = [
     ("app", "Phân tích nhanh", "🔍"),
     ("dashboard", "Dashboard", "📊"),
+    ("dealer_tracking", "Dealer Tracking", "🏬"),
     ("upload_center", "Upload Center", "⬆️"),
     ("forecast_engine", "Forecast Engine", "📈"),
     ("supply_plan", "Supply Plan", "🚚"),

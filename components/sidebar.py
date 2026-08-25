@@ -2,17 +2,8 @@ import streamlit as st
 from utils.auth import current_user, logout
 
 NAV_ITEMS = [
-    ("app", "Phân tích nhanh", "🔍"),
-    ("dashboard", "Dashboard", "📊"),
     ("dealer_tracking", "Dealer Tracking", "🏬"),
     ("upload_center", "Upload Center", "⬆️"),
-    ("forecast_engine", "Forecast Engine", "📈"),
-    ("supply_plan", "Supply Plan", "🚚"),
-    ("exception_report", "Exception Report", "⚠️"),
-    ("version_history", "Version History", "🕘"),
-    ("data_quality", "Data Quality", "✅"),
-    ("master_data", "Master Data", "🗂️"),
-    ("assumptions", "Assumptions", "⚙️"),
 ]
 
 

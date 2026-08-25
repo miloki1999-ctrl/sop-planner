@@ -21,7 +21,7 @@ require_login()
 render_sidebar("dealer_tracking")
 user = current_user()
 
-st.title("🏬 Dealer Tracking — CellphoneS & Minh Tuấn Mobile")
+st.title("🏬 Dealer Tracking")
 
 with get_session() as db:
     all_dealers = list_dealers(db)

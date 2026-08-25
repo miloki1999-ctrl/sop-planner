@@ -371,7 +371,7 @@ def compute_accuracy_for_version(db: Session, version: ForecastVersion) -> pd.Da
             continue
         d.actual_so = actual
         d.forecast_error = actual - d.final_forecast_so
-            d.forecast_accuracy = None
+        d.forecast_accuracy = None
 
         # Guard against division by zero when actual demand is 0.
         if actual:
